@@ -1,0 +1,1213 @@
+# FINAL PEDIATRIC TRANSPLANT ML PIPELINE
+
+import os
+import re
+import warnings
+import numpy a
+import shaps np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import fisher_exact, chi2_contingency, mannwhitneyu, spearmanr
+from statsmodels.stats.multitest import multipletests
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.model_selection import StratifiedKFold
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.calibration import calibration_curve
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import (
+    roc_curve, roc_auc_score,
+    precision_recall_curve, average_precision_score,
+    confusion_matrix, accuracy_score,
+    f1_score, precision_score, recall_score
+)
+from xgboost import XGBClassifier
+warnings.filterwarnings("ignore")
+np.random.seed(42)
+
+# PATHS
+output_dir = ***
+file_path = ***
+
+os.makedirs(output_dir, exist_ok=True)
+print(f"Saving outputs to: {output_dir}")
+
+# HELPERS
+def convert_time_to_minutes(val):
+    if pd.isna(val):
+        return np.nan
+
+    val = str(val).strip()
+    val = re.sub(r"\.0+$", "", val)
+
+    if ":" in val:
+        parts = val.split(":")
+        try:
+            parts = [float(p) for p in parts]
+            if len(parts) == 2:
+                return parts[0] * 60 + parts[1]
+            elif len(parts) == 3:
+                return parts[0] * 60 + parts[1] + parts[2] / 60
+        except Exception:
+            return np.nan
+
+    try:
+        num = float(val)
+        if num <= 24:
+            return num * 60
+        elif num > 1000:
+            return num / 60
+        else:
+            return num
+    except Exception:
+        return np.nan
+
+def safe_mode(s):
+    s = pd.Series(s).dropna()
+    return s.mode().iloc[0] if not s.mode().empty else np.nan
+
+def interp_curve(x, y, grid):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+
+    if len(x) == 0:
+        return np.full(len(grid), np.nan, dtype=float)
+
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+
+    x_unique, idx = np.unique(x, return_index=True)
+    y_unique = y[idx]
+
+    out = np.full(len(grid), np.nan, dtype=float)
+    if len(x_unique) == 1:
+        valid = (grid == x_unique[0])
+        out[valid] = y_unique[0]
+        return out
+
+    valid = (grid >= x_unique.min()) & (grid <= x_unique.max())
+    out[valid] = np.interp(grid[valid], x_unique, y_unique)
+    return out
+
+def get_feature_names_from_pipeline(fitted_pipe):
+    prep = fitted_pipe.named_steps["prep"]
+    try:
+        return prep.get_feature_names_out()
+    except Exception:
+        names = []
+        for name, trans, cols in prep.transformers_:
+            if name == "remainder":
+                continue
+            if hasattr(trans, "named_steps"):
+                last_step = list(trans.named_steps.values())[-1]
+                if hasattr(last_step, "get_feature_names_out"):
+                    try:
+                        step_names = last_step.get_feature_names_out(cols)
+                    except Exception:
+                        step_names = last_step.get_feature_names_out()
+                    names.extend(step_names)
+                else:
+                    names.extend(cols)
+            else:
+                names.extend(cols)
+        return np.array(names, dtype=object)
+
+class DropAllMissing(BaseEstimator, TransformerMixin):
+    def fit(self, X, y=None):
+        X = pd.DataFrame(X)
+        self.cols_ = X.columns[X.notna().any()].tolist()
+        return self
+
+    def transform(self, X):
+        X = pd.DataFrame(X)
+        for c in self.cols_:
+            if c not in X.columns:
+                X[c] = np.nan
+        return X[self.cols_]
+
+def log1p_safe(x):
+    x = np.asarray(x, dtype=float)
+    return np.log1p(np.clip(x, a_min=0, a_max=None))
+
+def is_binary_numeric(series):
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty:
+        return False
+    uniq = set(pd.unique(s))
+    return uniq.issubset({0, 1})
+
+def mean_ci(x, z=1.96):
+    x = pd.Series(x).dropna().astype(float)
+    if len(x) == 0:
+        return np.nan, np.nan, np.nan
+    mean = x.mean()
+    if len(x) == 1:
+        return mean, np.nan, np.nan
+    se = x.std(ddof=1) / np.sqrt(len(x))
+    return mean, mean - z * se, mean + z * se
+
+def compute_ece(y_true, y_prob, n_bins=10):
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+
+    bins = np.linspace(0, 1, n_bins + 1)
+    binids = np.digitize(y_prob, bins, right=False) - 1
+    binids = np.clip(binids, 0, n_bins - 1)
+
+    ece = 0.0
+    for i in range(n_bins):
+        mask = binids == i
+        if np.sum(mask) == 0:
+            continue
+        acc = np.mean(y_true[mask])
+        conf = np.mean(y_prob[mask])
+        ece += np.abs(acc - conf) * (np.sum(mask) / len(y_true))
+    return ece
+
+def decision_curve_analysis(y_true, y_prob, thresholds):
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    n = len(y_true)
+    net_benefit = []
+
+    for t in thresholds:
+        preds = (y_prob >= t).astype(int)
+        tp = np.sum((preds == 1) & (y_true == 1))
+        fp = np.sum((preds == 1) & (y_true == 0))
+        nb = (tp / n) - (fp / n) * (t / (1 - t))
+        net_benefit.append(nb)
+
+    return np.array(net_benefit)
+
+def find_optimal_threshold(y_true, y_prob, metric="f1"):
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    thresholds = np.unique(np.round(np.linspace(0.01, 0.99, 199), 6))
+
+    rows = []
+    for t in thresholds:
+        pred = (y_prob >= t).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_true, pred, labels=[0, 1]).ravel()
+
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+        ppv = tp / (tp + fp) if (tp + fp) > 0 else np.nan
+        npv = tn / (tn + fn) if (tn + fn) > 0 else np.nan
+        f1 = f1_score(y_true, pred, zero_division=0)
+        acc = accuracy_score(y_true, pred)
+
+        rows.append({
+            "threshold": t,
+            "f1": f1,
+            "accuracy": acc,
+            "sensitivity": sensitivity,
+            "specificity": specificity,
+            "ppv": ppv,
+            "npv": npv,
+            "tp": tp,
+            "fp": fp,
+            "tn": tn,
+            "fn": fn
+        })
+
+    thr_df = pd.DataFrame(rows)
+
+    if metric.lower() == "accuracy":
+        best_idx = thr_df["accuracy"].idxmax()
+    else:
+        best_idx = thr_df["f1"].idxmax()
+
+    return thr_df, thr_df.loc[best_idx].to_dict()
+
+def bootstrap_pr_auc_diff(y_true, prob_a, prob_b, n_boot=2000, random_state=42):
+    rng = np.random.default_rng(random_state)
+    y_true = np.asarray(y_true)
+    prob_a = np.asarray(prob_a)
+    prob_b = np.asarray(prob_b)
+
+    diffs = []
+    n = len(y_true)
+
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        y_b = y_true[idx]
+        if np.unique(y_b).size < 2:
+            continue
+
+        pa = prob_a[idx]
+        pb = prob_b[idx]
+
+        try:
+            auc_a = average_precision_score(y_b, pa)
+            auc_b = average_precision_score(y_b, pb)
+            diffs.append(auc_a - auc_b)
+        except Exception:
+            continue
+
+    diffs = np.asarray(diffs, dtype=float)
+    if diffs.size == 0:
+        return {
+            "PR_AUC_Diff_Mean": np.nan,
+            "CI_Low": np.nan,
+            "CI_High": np.nan,
+            "P_bootstrap_two_sided": np.nan,
+            "n_boot_valid": 0
+        }
+
+    p_two = 2 * min(np.mean(diffs <= 0), np.mean(diffs >= 0))
+    p_two = min(p_two, 1.0)
+
+    return {
+        "PR_AUC_Diff_Mean": np.mean(diffs),
+        "CI_Low": np.percentile(diffs, 2.5),
+        "CI_High": np.percentile(diffs, 97.5),
+        "P_bootstrap_two_sided": p_two,
+        "n_boot_valid": diffs.size
+    }
+
+
+# LOAD DATA
+data = pd.read_csv(file_path)
+
+# HEIGHT / BMI ENGINEERING
+if "HeightIn" in data.columns:
+    data["HeightIn"] = pd.to_numeric(data["HeightIn"], errors="coerce")
+    data["Height_m"] = data["HeightIn"] * 0.0254
+
+if "WeightKg" in data.columns:
+    data["WeightKg"] = pd.to_numeric(data["WeightKg"], errors="coerce")
+
+if "Height_m" in data.columns and "WeightKg" in data.columns:
+    data["BMI"] = data["WeightKg"] / (data["Height_m"] ** 2)
+    data.loc[data["Height_m"] <= 0, "BMI"] = np.nan
+    data.loc[data["BMI"] > 100, "BMI"] = np.nan
+
+data = data.drop(columns=["HeightIn"], errors="ignore")
+
+# TARGET CLEANING
+data[target] = pd.to_numeric(data[target], errors="coerce")
+data = data.dropna(subset=[target]).copy()
+data[target] = data[target].astype(int)
+
+# pediatric filter
+if "Age" in data.columns:
+    data["Age"] = pd.to_numeric(data["Age"], errors="coerce")
+    data = data[data["Age"] < 18].copy()
+
+# TIME VARIABLES
+time_features_all = [
+    "time_asystole",
+    "time_brain_death",
+    "time_referred",
+    "time_approached",
+    "time_authorized",
+    "time_procured"
+]
+
+for col in time_features_all:
+    if col in data.columns:
+        data[col] = data[col].apply(convert_time_to_minutes)
+        data[f"{col}_missing"] = data[col].isna().astype(int)
+
+# TIME INTERVAL ENGINEERING
+interval_definitions = {
+    "t_ref_to_approach": ("time_approached", "time_referred"),
+    "t_approach_to_auth": ("time_authorized", "time_approached"),
+    "t_auth_to_procure": ("time_procured", "time_authorized"),
+    "t_ref_to_procure": ("time_procured", "time_referred"),
+    "t_brain_to_procure": ("time_procured", "time_brain_death"),
+    "t_asystole_to_procure": ("time_procured", "time_asystole"),
+}
+
+created_intervals = []
+
+for new_col, (t1, t2) in interval_definitions.items():
+    if t1 in data.columns and t2 in data.columns:
+        data[new_col] = data[t1] - data[t2]
+        data.loc[data[new_col] < 0, new_col] = np.nan
+        data[f"{new_col}_missing"] = data[new_col].isna().astype(int)
+        created_intervals.append(new_col)
+
+# INTERACTION FEATURES
+ratio_features = []
+
+if "t_auth_to_procure" in data.columns and "t_brain_to_procure" in data.columns:
+    data["t_delay_ratio"] = data["t_auth_to_procure"] / (data["t_brain_to_procure"] + 1)
+    data.loc[~np.isfinite(data["t_delay_ratio"]), "t_delay_ratio"] = np.nan
+    data.loc[data["t_delay_ratio"] < 0, "t_delay_ratio"] = np.nan
+    data["t_delay_ratio_missing"] = data["t_delay_ratio"].isna().astype(int)
+
+    data["t_delay_diff"] = data["t_auth_to_procure"] - data["t_brain_to_procure"]
+    data.loc[data["t_delay_diff"] < 0, "t_delay_diff"] = np.nan
+    data["t_delay_diff_missing"] = data["t_delay_diff"].isna().astype(int)
+
+    ratio_features = ["t_delay_ratio", "t_delay_diff"]
+
+    if "t_delay_diff" not in created_intervals:
+        created_intervals.append("t_delay_diff")
+
+# timeline sanity check
+if all(col in data.columns for col in ["time_referred", "time_procured"]):
+    data["t_total_donor_time"] = data["time_procured"] - data["time_referred"]
+    data.loc[data["t_total_donor_time"] < 0, "t_total_donor_time"] = np.nan
+    data["t_total_donor_time_missing"] = data["t_total_donor_time"].isna().astype(int)
+    created_intervals.append("t_total_donor_time")
+
+# log transform intervals
+for col in created_intervals:
+    data[col] = log1p_safe(data[col])
+
+data = data.replace([np.inf, -np.inf], np.nan)
+
+# DROP ID / LEAKAGE
+drop_cols = ["PatientID", "HospitalID"]
+outcome_cols = [c for c in data.columns if c.startswith("outcome_")]
+exact_leak_cols = [c for c in ["approached", "authorized", "procured", "transplanted"] if c in data.columns]
+extra_leak_candidates = ["Pulm_Transplanted", "Kidney_Transplanted"]
+extra_leak_cols = [c for c in extra_leak_candidates if c in data.columns]
+
+y = data[target].copy()
+X = data.drop(columns=drop_cols + outcome_cols + exact_leak_cols + extra_leak_cols, errors="ignore").copy()
+
+# MANUAL FEATURE GROUPS
+numeric_features_master = [
+    "Age", "Height_m", "WeightKg", "BMI",
+    "PH", "PCO2", "PO2", "HCO3", "BE", "FIO2", "O2SAT",
+    "PIP", "PEEP", "TV", "Rate",
+    "WBC", "Hct", "Hgb", "Ptl", "Band", "Segs", "Lymp", "Mono", "Eos", "RBC",
+    "Albumin", "AlkPhos", "Amylase", "BNP", "BUN", "CI", "CKMB", "CO2", "Calcium",
+    "Cpk", "CpkIndex", "Creatinine", "CreatinineClearance",
+    "DirectBili", "Fibrinogen", "GGT", "Glucose", "HgbA1C", "INR",
+    "IndirectBili", "IonizedCalcium", "K", "LDH", "Lactate", "Lipase", "LipaseULN",
+    "Mg", "PT", "PTT", "Phosphorous", "SGOTAST", "SGPTALT",
+    "SerumBetaHCG", "SerumOsmo", "TotalBili", "TotalMB", "TotalProtein",
+    "TroponinI", "TroponinT",
+    "Intake_BloodProduct", "Intake_Colloid", "Intake_Crystalloid", "Intake_Total",
+    "Output_NonUrine", "Output_Urine",
+    "DBP", "HR", "SBP", "Temp", "UOP",
+    "Referral_Year", "Procured_Year"
+]
+
+# Drop raw time variables
+X = X.drop(columns=time_features_all, errors="ignore")
+
+# engineered interval features
+interval_features = [c for c in X.columns if c.startswith("t_") and not c.endswith("_missing")]
+interval_missing = [c for c in X.columns if c.startswith("t_") and c.endswith("_missing")]
+
+# final feature groups
+time_features = [c for c in interval_features if c in X.columns] + [c for c in ratio_features if c in X.columns]
+time_features = list(dict.fromkeys(time_features))
+
+numeric_features = [c for c in numeric_features_master if c in X.columns] + [c for c in interval_missing if c in X.columns]
+numeric_features = list(dict.fromkeys(numeric_features))
+
+categorical_features = [c for c in X.columns if c not in numeric_features + time_features]
+
+# type coercion
+for c in numeric_features + time_features:
+    if c in X.columns:
+        X[c] = pd.to_numeric(X[c], errors="coerce")
+
+for c in categorical_features:
+    if c in X.columns:
+        X[c] = X[c].astype("category")
+
+numeric_features = [c for c in numeric_features if c in X.columns]
+time_features = [c for c in time_features if c in X.columns]
+categorical_features = [c for c in categorical_features if c in X.columns]
+
+print("\nFeature counts:")
+print("Numeric:", len(numeric_features))
+print("Time:", len(time_features))
+print("Categorical:", len(categorical_features))
+
+feature_map_df = pd.DataFrame({
+    "feature": numeric_features + time_features + categorical_features,
+    "group": (["numeric"] * len(numeric_features)) +
+             (["time"] * len(time_features)) +
+             (["categorical"] * len(categorical_features))
+})
+feature_map_df.to_csv(os.path.join(output_dir, "feature_groups.csv"), index=False)
+
+# Descriptive stats
+table = data.copy()
+y_table = table[target].copy()
+
+table_candidate_cols = [c for c in X.columns if c in table.columns]
+
+table_cont_cols = []
+table_cat_cols = []
+
+for c in table_candidate_cols:
+    if c in time_features:
+        table_cont_cols.append(c)
+    elif c in numeric_features:
+        if is_binary_numeric(table[c]):
+            table_cat_cols.append(c)
+        else:
+            table_cont_cols.append(c)
+    else:
+        table_cat_cols.append(c)
+
+table_cont_cols = list(dict.fromkeys(table_cont_cols))
+table_cat_cols = list(dict.fromkeys(table_cat_cols))
+
+print("\nTable 1 variable counts:")
+print("Continuous:", len(table_cont_cols))
+print("Categorical:", len(table_cat_cols))
+
+pd.DataFrame({"Continuous_Variables": pd.Series(table_cont_cols)}).to_csv(
+    os.path.join(output_dir, "Table1_continuous_variable_list.csv"), index=False
+)
+pd.DataFrame({"Categorical_Variables": pd.Series(table_cat_cols)}).to_csv(
+    os.path.join(output_dir, "Table1_categorical_variable_list.csv"), index=False
+)
+
+# Continuous
+cont_rows = []
+for c in table_cont_cols:
+    s = pd.to_numeric(table[c], errors="coerce")
+    s0 = s[y_table == 0]
+    s1 = s[y_table == 1]
+
+    # Compute means + CI
+    mean_all, ci_all_low, ci_all_high = mean_ci(s)
+    mean_0, ci_0_low, ci_0_high = mean_ci(s0)
+    mean_1, ci_1_low, ci_1_high = mean_ci(s1)
+
+    pval = np.nan
+    if s0.notna().sum() > 0 and s1.notna().sum() > 0:
+        try:
+            pval = mannwhitneyu(s0.dropna(), s1.dropna(), alternative="two-sided").pvalue
+        except Exception:
+            pval = np.nan
+
+    cont_rows.append({
+        "Variable": c,
+
+        # ALL
+        "Mean_All": mean_all,
+        "Mean_All_CI_Low": ci_all_low,
+        "Mean_All_CI_High": ci_all_high,
+        "Median_All": s.median(),
+        "Mode_All": safe_mode(s),
+        "SD_All": s.std(),
+        "Q1_All": s.quantile(0.25),
+        "Q3_All": s.quantile(0.75),
+        "IQR_All": s.quantile(0.75) - s.quantile(0.25),
+
+        # Outcome 0
+        "Mean_Outcome0": mean_0,
+        "Mean_Outcome0_CI_Low": ci_0_low,
+        "Mean_Outcome0_CI_High": ci_0_high,
+        "Median_Outcome0": s0.median(),
+        "Mode_Outcome0": safe_mode(s0),
+        "SD_Outcome0": s0.std(),
+        "Q1_Outcome0": s0.quantile(0.25),
+        "Q3_Outcome0": s0.quantile(0.75),
+        "IQR_Outcome0": s0.quantile(0.75) - s0.quantile(0.25),
+
+        # Outcome 1
+        "Mean_Outcome1": mean_1,
+        "Mean_Outcome1_CI_Low": ci_1_low,
+        "Mean_Outcome1_CI_High": ci_1_high,
+        "Median_Outcome1": s1.median(),
+        "Mode_Outcome1": safe_mode(s1),
+        "SD_Outcome1": s1.std(),
+        "Q1_Outcome1": s1.quantile(0.25),
+        "Q3_Outcome1": s1.quantile(0.75),
+        "IQR_Outcome1": s1.quantile(0.75) - s1.quantile(0.25),
+
+        "p_value": pval
+    })
+
+cont_df = pd.DataFrame(cont_rows)
+
+if not cont_df.empty:
+    cont_df["FDR_BH"] = multipletests(cont_df["p_value"].fillna(1.0), method="fdr_bh")[1]
+
+cont_df.to_excel(os.path.join(output_dir, "Table1_Continuous.xlsx"), index=False)
+# Categorical Table 1
+cat_rows = []
+for c in table_cat_cols:
+    s = table[c].copy().astype("object")
+    s = s.where(~pd.isna(s), "Missing")
+
+    tab = pd.crosstab(s, y_table, dropna=False)
+
+    pval = np.nan
+    try:
+        if tab.shape == (2, 2):
+            pval = fisher_exact(tab.values)[1]
+        elif tab.shape[0] > 1 and tab.shape[1] > 1:
+            pval = chi2_contingency(tab)[1]
+    except Exception:
+        pval = np.nan
+
+    for level in tab.index:
+        n_all = int((s == level).sum())
+        n0 = int(((s == level) & (y_table == 0)).sum())
+        n1 = int(((s == level) & (y_table == 1)).sum())
+
+        denom_all = int(len(y_table))
+        denom0 = int((y_table == 0).sum())
+        denom1 = int((y_table == 1).sum())
+
+        pct_all = 100 * n_all / denom_all if denom_all > 0 else np.nan
+        pct0 = 100 * n0 / denom0 if denom0 > 0 else np.nan
+        pct1 = 100 * n1 / denom1 if denom1 > 0 else np.nan
+
+        cat_rows.append({
+            "Variable": c,
+            "Level": level,
+            "N_All": n_all,
+            "Pct_All": pct_all,
+            "N_Outcome0": n0,
+            "Pct_Outcome0": pct0,
+            "N_Outcome1": n1,
+            "Pct_Outcome1": pct1,
+            "Mode_All": safe_mode(s),
+            "Mode_Outcome0": safe_mode(s[y_table == 0]),
+            "Mode_Outcome1": safe_mode(s[y_table == 1]),
+            "p_value": pval
+        })
+
+cat_df = pd.DataFrame(cat_rows)
+if not cat_df.empty:
+    var_p = cat_df[["Variable", "p_value"]].drop_duplicates().copy()
+    var_p["FDR_BH"] = multipletests(var_p["p_value"].fillna(1.0), method="fdr_bh")[1]
+    cat_df = cat_df.merge(var_p[["Variable", "FDR_BH"]], on="Variable", how="left")
+
+cat_df.to_excel(os.path.join(output_dir, "Table1_Categorical.xlsx"), index=False)
+
+# PREPROCESSING
+num_pipeline = Pipeline([
+    ("drop", DropAllMissing()),
+    ("imp", SimpleImputer(strategy="median")),
+    ("sc", StandardScaler())
+])
+
+cat_pipeline = Pipeline([
+    ("drop", DropAllMissing()),
+    ("imp", SimpleImputer(strategy="most_frequent")),
+    ("oh", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+])
+
+time_pipeline = Pipeline([
+    ("drop", DropAllMissing()),
+    ("imp", SimpleImputer(strategy="median")),
+    ("sc", StandardScaler())
+])
+
+prep = ColumnTransformer([
+    ("time", time_pipeline, time_features),
+    ("num", num_pipeline, numeric_features),
+    ("cat", cat_pipeline, categorical_features)
+], remainder="drop")
+
+# models
+pos = int((y == 1).sum())
+neg = int((y == 0).sum())
+scale_pos_weight = (neg / pos) if pos > 0 else 1.0
+
+models = {
+    "LR": LogisticRegression(max_iter=3000, class_weight="balanced", random_state=42),
+    "RF": RandomForestClassifier(
+        n_estimators=500,
+        class_weight="balanced",
+        random_state=42,
+        n_jobs=-1
+    ),
+    "XGB": XGBClassifier(
+        n_estimators=500,
+        learning_rate=0.03,
+        max_depth=4,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        eval_metric="logloss",
+        random_state=42,
+        scale_pos_weight=scale_pos_weight
+    )
+}
+
+# CV
+outer = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+roc_grid = np.linspace(0, 1, 201)
+pr_grid = np.linspace(0, 1, 201)
+cal_grid = np.linspace(0, 1, 101)
+
+summary_rows = []
+all_model_fold_metrics = []
+best_model_name = None
+best_model_pr = -np.inf
+
+# store OOF probs for bootstrap comparison
+oof_prob_store = {}
+oof_true_store = {}
+
+for model_name, model in models.items():
+    fold_metrics = []
+    roc_interps = []
+    pr_interps = []
+    cal_interps = []
+    cms = []
+
+    oof_true = []
+    oof_pred = []
+    oof_prob = []
+
+    for fold, (tr, te) in enumerate(outer.split(X, y), start=1):
+        X_tr, X_te = X.iloc[tr].copy(), X.iloc[te].copy()
+        y_tr, y_te = y.iloc[tr].copy(), y.iloc[te].copy()
+
+        pipe = Pipeline([
+            ("prep", prep),
+            ("clf", model)
+        ])
+
+        pipe.fit(X_tr, y_tr)
+        prob = pipe.predict_proba(X_te)[:, 1]
+        pred = (prob >= 0.5).astype(int)
+
+        oof_true.extend(y_te.tolist())
+        oof_pred.extend(pred.tolist())
+        oof_prob.extend(prob.tolist())
+
+        roc_auc = roc_auc_score(y_te, prob)
+        pr_auc = average_precision_score(y_te, prob)
+        acc = accuracy_score(y_te, pred)
+
+        fold_metrics.append({
+            "Model": model_name,
+            "Fold": fold,
+            "ROC_AUC": roc_auc,
+            "PR_AUC": pr_auc,
+            "Accuracy": acc
+        })
+
+        # ROC
+        fpr, tpr, _ = roc_curve(y_te, prob)
+        tpr_interp = interp_curve(fpr, tpr, roc_grid)
+        if len(tpr_interp) > 0:
+            tpr_interp[0] = 0.0
+            tpr_interp[-1] = 1.0
+        roc_interps.append(tpr_interp)
+
+        # PR
+        precision, recall, _ = precision_recall_curve(y_te, prob)
+        recall_rev = recall[::-1]
+        precision_rev = precision[::-1]
+        pr_interp = interp_curve(recall_rev, precision_rev, pr_grid)
+        pr_interps.append(pr_interp)
+
+        # Calibration
+        prob_true, prob_pred = calibration_curve(y_te, prob, n_bins=10, strategy="quantile")
+        cal_interp = interp_curve(prob_pred, prob_true, cal_grid)
+        cal_interps.append(cal_interp)
+
+        # Confusion matrix
+        cms.append(confusion_matrix(y_te, pred, labels=[0, 1]))
+
+    fold_df = pd.DataFrame(fold_metrics)
+    fold_df.to_csv(os.path.join(output_dir, f"{model_name}_fold_metrics.csv"), index=False)
+    all_model_fold_metrics.append(fold_df)
+
+    roc_mean, roc_ci_low, roc_ci_high = mean_ci(fold_df["ROC_AUC"])
+    pr_mean, pr_ci_low, pr_ci_high = mean_ci(fold_df["PR_AUC"])
+    acc_mean, acc_ci_low, acc_ci_high = mean_ci(fold_df["Accuracy"])
+
+    model_summary = {
+        "Model": model_name,
+        "ROC_AUC_Mean": roc_mean,
+        "ROC_AUC_SD": fold_df["ROC_AUC"].std(),
+        "ROC_AUC_CI_Low": roc_ci_low,
+        "ROC_AUC_CI_High": roc_ci_high,
+        "PR_AUC_Mean": pr_mean,
+        "PR_AUC_SD": fold_df["PR_AUC"].std(),
+        "PR_AUC_CI_Low": pr_ci_low,
+        "PR_AUC_CI_High": pr_ci_high,
+        "Accuracy_Mean": acc_mean,
+        "Accuracy_SD": fold_df["Accuracy"].std(),
+        "Accuracy_CI_Low": acc_ci_low,
+        "Accuracy_CI_High": acc_ci_high
+    }
+    summary_rows.append(model_summary)
+
+    if model_summary["PR_AUC_Mean"] > best_model_pr:
+        best_model_pr = model_summary["PR_AUC_Mean"]
+        best_model_name = model_name
+
+    # ROC plot
+    plt.figure(figsize=(7, 6))
+    for i, arr in enumerate(roc_interps, start=1):
+        plt.plot(roc_grid, arr, alpha=0.35, label=f"Fold {i}")
+    mean_roc = np.nanmean(np.vstack(roc_interps), axis=0)
+    plt.plot(roc_grid, mean_roc, linewidth=3, label=f"Mean (AUC={fold_df['ROC_AUC'].mean():.3f})")
+    plt.plot([0, 1], [0, 1], "--")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(f"{model_name} ROC Curves (5 folds + mean)")
+    plt.legend(loc="lower right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{model_name}_ROC_5folds_plus_mean.png"), dpi=300)
+    plt.close()
+
+    # PR plot
+    plt.figure(figsize=(7, 6))
+    for i, arr in enumerate(pr_interps, start=1):
+        plt.plot(pr_grid, arr, alpha=0.35, label=f"Fold {i}")
+    mean_pr = np.nanmean(np.vstack(pr_interps), axis=0)
+    plt.plot(pr_grid, mean_pr, linewidth=3, label=f"Mean (AP={fold_df['PR_AUC'].mean():.3f})")
+    base_rate = y.mean()
+    plt.axhline(base_rate, linestyle="--", label=f"Prevalence={base_rate:.3f}")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title(f"{model_name} PR Curves (5 folds + mean)")
+    plt.legend(loc="lower left")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{model_name}_PR_5folds_plus_mean.png"), dpi=300)
+    plt.close()
+
+    # Calibration plot
+    plt.figure(figsize=(7, 6))
+    for i, arr in enumerate(cal_interps, start=1):
+        plt.plot(cal_grid, arr, alpha=0.35, label=f"Fold {i}")
+    mean_cal = np.nanmean(np.vstack(cal_interps), axis=0)
+    plt.plot(cal_grid, mean_cal, linewidth=3, label="Mean")
+    plt.plot([0, 1], [0, 1], "--")
+    plt.xlabel("Predicted Probability")
+    plt.ylabel("Observed Probability")
+    plt.title(f"{model_name} Calibration Curves (5 folds + mean)")
+    plt.legend(loc="upper left")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{model_name}_Calibration_5folds_plus_mean.png"), dpi=300)
+    plt.close()
+
+    # Aggregate confusion matrices
+    cm_sum = np.sum(np.stack(cms, axis=0), axis=0)
+    cm_mean = np.mean(np.stack(cms, axis=0), axis=0)
+
+    plt.figure(figsize=(5, 4))
+    sns.heatmap(cm_sum, annot=True, fmt="d", cbar=False)
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.title(f"{model_name} Confusion Matrix (sum across 5 folds)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{model_name}_CM_sum_5folds.png"), dpi=300)
+    plt.close()
+
+    plt.figure(figsize=(5, 4))
+    sns.heatmap(cm_mean, annot=True, fmt=".2f", cbar=False)
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.title(f"{model_name} Confusion Matrix (mean across 5 folds)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{model_name}_CM_mean_5folds.png"), dpi=300)
+    plt.close()
+
+    oof_df = pd.DataFrame({
+        "y_true": oof_true,
+        "y_pred": oof_pred,
+        "y_prob": oof_prob
+    })
+    oof_df.to_csv(os.path.join(output_dir, f"{model_name}_OOF_predictions.csv"), index=False)
+
+    oof_prob_store[model_name] = np.asarray(oof_prob, dtype=float)
+    oof_true_store[model_name] = np.asarray(oof_true, dtype=int)
+
+summary_df = pd.DataFrame(summary_rows).sort_values("PR_AUC_Mean", ascending=False)
+summary_df.to_csv(os.path.join(output_dir, "model_summary.csv"), index=False)
+summary_df.to_csv(os.path.join(output_dir, "model_summary_with_CI.csv"), index=False)
+
+pd.concat(all_model_fold_metrics, ignore_index=True).to_csv(
+    os.path.join(output_dir, "all_models_fold_metrics.csv"), index=False
+)
+
+print(f"\nBest model by mean PR_AUC: {best_model_name}")
+
+# Post hoc eval
+eval_rows = []
+threshold_rows = []
+clinical_rows = []
+
+thresholds = np.linspace(0.01, 0.99, 100)
+
+plt.figure(figsize=(7, 6))
+
+for model_name in models.keys():
+    oof_path = os.path.join(output_dir, f"{model_name}_OOF_predictions.csv")
+    df = pd.read_csv(oof_path)
+
+    y_true = df["y_true"].values
+    y_prob = df["y_prob"].values
+    y_pred = df["y_pred"].values  # 0.5 threshold predictions
+
+    # METRICS AT DEFAULT THRESHOLD 0.5
+    roc_auc = roc_auc_score(y_true, y_prob)
+    pr_auc = average_precision_score(y_true, y_prob)
+    acc = accuracy_score(y_true, y_pred)
+    brier = np.mean((y_prob - y_true) ** 2)
+    ece = compute_ece(y_true, y_prob)
+
+    eval_rows.append({
+        "Model": model_name,
+        "ROC_AUC": roc_auc,
+        "PR_AUC": pr_auc,
+        "Accuracy": acc,
+        "Brier": brier,
+        "ECE": ece
+    })
+
+    # Threshold opt on oof 
+    thr_df, best_thr = find_optimal_threshold(y_true, y_prob, metric="f1")
+    thr_df.to_csv(os.path.join(output_dir, f"{model_name}_threshold_grid_search.csv"), index=False)
+
+    threshold_rows.append({
+        "Model": model_name,
+        "Optimal_Threshold_F1": best_thr["threshold"],
+        "Best_F1": best_thr["f1"],
+        "Accuracy_at_Optimal_Threshold": best_thr["accuracy"]
+    })
+
+    clinical_rows.append({
+        "Model": model_name,
+        "Optimal_Threshold_F1": best_thr["threshold"],
+        "Sensitivity": best_thr["sensitivity"],
+        "Specificity": best_thr["specificity"],
+        "PPV": best_thr["ppv"],
+        "NPV": best_thr["npv"],
+        "TP": best_thr["tp"],
+        "FP": best_thr["fp"],
+        "TN": best_thr["tn"],
+        "FN": best_thr["fn"]
+    })
+
+    # DCA
+    nb_model = decision_curve_analysis(y_true, y_prob, thresholds)
+    plt.plot(thresholds, nb_model, label=model_name)
+
+# treat all
+prevalence = y.mean()
+nb_all = prevalence - (1 - prevalence) * (thresholds / (1 - thresholds))
+plt.plot(thresholds, nb_all, linestyle="--", label="Treat All")
+
+# treat none
+plt.plot(thresholds, np.zeros_like(thresholds), linestyle="--", label="Treat None")
+
+plt.xlabel("Threshold Probability")
+plt.ylabel("Net Benefit")
+plt.title("Decision Curve Analysis")
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "Decision_Curve_Analysis.png"), dpi=300)
+plt.close()
+
+# Save Metrics
+eval_df = pd.DataFrame(eval_rows).sort_values("PR_AUC", ascending=False)
+eval_df.to_csv(os.path.join(output_dir, "model_evaluation_metrics.csv"), index=False)
+
+threshold_df = pd.DataFrame(threshold_rows).sort_values("Best_F1", ascending=False)
+threshold_df.to_csv(os.path.join(output_dir, "optimal_thresholds.csv"), index=False)
+
+clinical_df = pd.DataFrame(clinical_rows).sort_values("Sensitivity", ascending=False)
+clinical_df.to_csv(os.path.join(output_dir, "clinical_metrics.csv"), index=False)
+
+# Discrimination bar plot 
+plt.figure(figsize=(8, 6))
+plt.bar(eval_df["Model"], eval_df["ROC_AUC"])
+plt.ylabel("ROC AUC")
+plt.title("Model Discrimination (ROC AUC)")
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "Discrimination_ROC_AUC.png"), dpi=300)
+plt.close()
+
+plt.figure(figsize=(8, 6))
+plt.bar(eval_df["Model"], eval_df["PR_AUC"])
+plt.ylabel("PR AUC")
+plt.title("Model Discrimination (PR AUC)")
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "Discrimination_PR_AUC.png"), dpi=300)
+plt.close()
+
+# Calibration metrics plot
+plt.figure(figsize=(8, 6))
+plt.bar(eval_df["Model"], eval_df["Brier"])
+plt.ylabel("Brier Score")
+plt.title("Calibration (Brier Score)")
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "Calibration_Brier.png"), dpi=300)
+plt.close()
+
+plt.figure(figsize=(8, 6))
+plt.bar(eval_df["Model"], eval_df["ECE"])
+plt.ylabel("ECE")
+plt.title("Calibration (Expected Calibration Error)")
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "Calibration_ECE.png"), dpi=300)
+plt.close()
+
+# Clinical metrics plots at opt thresh
+for metric_name, title in [
+    ("Sensitivity", "Sensitivity at Optimal Threshold"),
+    ("Specificity", "Specificity at Optimal Threshold"),
+    ("PPV", "Positive Predictive Value at Optimal Threshold"),
+    ("NPV", "Negative Predictive Value at Optimal Threshold"),
+]:
+    plt.figure(figsize=(8, 6))
+    plt.bar(clinical_df["Model"], clinical_df[metric_name])
+    plt.ylabel(metric_name)
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{metric_name}_at_optimal_threshold.png"), dpi=300)
+    plt.close()
+
+print("Added discrimination, calibration metrics, and DCA plots")
+print("Added optimal thresholds and clinical metrics")
+
+# Bootstrap model 
+bootstrap_rows = []
+model_names = list(models.keys())
+
+# assume OOF order should match across models; use first model's y_true
+reference_y = oof_true_store[model_names[0]]
+
+for model_a in model_names:
+    for model_b in model_names:
+        if model_a >= model_b:
+            continue
+
+        y_a = oof_true_store[model_a]
+        y_b = oof_true_store[model_b]
+
+        if not np.array_equal(y_a, y_b):
+            print(f"Warning: OOF y_true mismatch between {model_a} and {model_b}. Skipping bootstrap comparison.")
+            continue
+
+        stats = bootstrap_pr_auc_diff(
+            y_true=y_a,
+            prob_a=oof_prob_store[model_a],
+            prob_b=oof_prob_store[model_b],
+            n_boot=2000,
+            random_state=42
+        )
+
+        bootstrap_rows.append({
+            "Model_A": model_a,
+            "Model_B": model_b,
+            **stats
+        })
+
+bootstrap_df = pd.DataFrame(bootstrap_rows)
+bootstrap_df.to_csv(os.path.join(output_dir, "bootstrap_model_comparisons.csv"), index=False)
+
+# best fit model 
+best_model = models[best_model_name]
+best_pipe = Pipeline([
+    ("prep", prep),
+    ("clf", best_model)
+])
+best_pipe.fit(X, y)
+
+# Top transplant pred 
+perm = permutation_importance(
+    best_pipe,
+    X,
+    y,
+    scoring="average_precision",
+    n_repeats=10,
+    random_state=42,
+    n_jobs=-1
+)
+
+# permutation_importance on pipeline returns importances for original X columns
+perm_df = pd.DataFrame({
+    "Feature": X.columns,
+    "PermutationImportance_Mean": perm.importances_mean,
+    "PermutationImportance_SD": perm.importances_std
+}).sort_values("PermutationImportance_Mean", ascending=False)
+
+perm_df.to_csv(os.path.join(output_dir, "best_model_top_predictors_permutation_importance.csv"), index=False)
+
+top20_perm = perm_df.head(20).copy()
+plt.figure(figsize=(9, 8))
+plt.barh(top20_perm["Feature"][::-1], top20_perm["PermutationImportance_Mean"][::-1])
+plt.xlabel("Permutation Importance (average precision decrease)")
+plt.title(f"Top 20 Predictors - {best_model_name}")
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "best_model_top20_predictors.png"), dpi=300)
+plt.close()
+
+feature_names_expanded = get_feature_names_from_pipeline(best_pipe)
+clf = best_pipe.named_steps["clf"]
+
+expanded_imp_df = None
+if hasattr(clf, "coef_"):
+    coef = np.ravel(clf.coef_)
+    expanded_imp_df = pd.DataFrame({
+        "ExpandedFeature": feature_names_expanded,
+        "Coefficient": coef,
+        "AbsCoefficient": np.abs(coef)
+    }).sort_values("AbsCoefficient", ascending=False)
+    expanded_imp_df.to_csv(os.path.join(output_dir, "best_model_expanded_feature_coefficients.csv"), index=False)
+
+elif hasattr(clf, "feature_importances_"):
+    fi = np.ravel(clf.feature_importances_)
+    expanded_imp_df = pd.DataFrame({
+        "ExpandedFeature": feature_names_expanded,
+        "FeatureImportance": fi
+    }).sort_values("FeatureImportance", ascending=False)
+    expanded_imp_df.to_csv(os.path.join(output_dir, "best_model_expanded_feature_importances.csv"), index=False)
+
+# Correlations
+X_corr = X.copy()
+
+num_for_corr = [c for c in numeric_features + time_features if c in X_corr.columns]
+cat_for_corr = [c for c in categorical_features if c in X_corr.columns]
+
+corr_parts = []
+
+if len(num_for_corr) > 0:
+    corr_parts.append(X_corr[num_for_corr].apply(pd.to_numeric, errors="coerce"))
+
+if len(cat_for_corr) > 0:
+    corr_parts.append(pd.get_dummies(X_corr[cat_for_corr].astype(str), prefix=cat_for_corr, drop_first=False))
+
+corr_df = pd.concat(corr_parts, axis=1)
+corr_df = corr_df.loc[:, ~corr_df.columns.duplicated()].copy()
+
+corr_rows = []
+for col in corr_df.columns:
+    s = pd.to_numeric(corr_df[col], errors="coerce")
+    valid = s.notna() & y.notna()
+
+    if valid.sum() < 3:
+        continue
+    if s[valid].nunique(dropna=True) < 2:
+        continue
+
+    try:
+        rho, pval = spearmanr(s[valid], y[valid])
+    except Exception:
+        rho, pval = np.nan, np.nan
+
+    corr_rows.append({
+        "Variable": col,
+        "Spearman_rho": rho,
+        "p_value": pval,
+        "Abs_rho": np.abs(rho) if pd.notna(rho) else np.nan
+    })
+
+corr_out_df = pd.DataFrame(corr_rows).sort_values("Spearman_rho", ascending=False)
+corr_out_df.to_csv(os.path.join(output_dir, "all_correlations_with_outcome.csv"), index=False)
+
+top10_positive = corr_out_df.head(10).copy()
+top10_negative = corr_out_df.sort_values("Spearman_rho", ascending=True).head(10).copy()
+
+top10_positive.to_csv(os.path.join(output_dir, "top10_positive_correlations_with_outcome.csv"), index=False)
+top10_negative.to_csv(os.path.join(output_dir, "top10_negative_correlations_with_outcome.csv"), index=False)
+
+plt.figure(figsize=(8, 6))
+plt.barh(top10_positive["Variable"][::-1], top10_positive["Spearman_rho"][::-1])
+plt.xlabel("Spearman rho")
+plt.title("Top 10 Positive Correlations with Outcome")
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "top10_positive_correlations_with_outcome.png"), dpi=300)
+plt.close()
+
+plt.figure(figsize=(8, 6))
+plt.barh(top10_negative["Variable"], top10_negative["Spearman_rho"])
+plt.xlabel("Spearman rho")
+plt.title("Top 10 Negative Correlations with Outcome")
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "top10_negative_correlations_with_outcome.png"), dpi=300)
+plt.close()
+
+# final notes
+with open(os.path.join(output_dir, "run_notes.txt"), "w", encoding="utf-8") as f:
+    f.write("Pipeline complete.\n")
+    f.write(f"Best model by mean PR_AUC: {best_model_name}\n")
+    f.write(f"Rows analyzed: {len(X)}\n")
+    f.write(f"Outcome prevalence: {y.mean():.6f}\n")
+    f.write(f"Numeric features: {len(numeric_features)}\n")
+    f.write(f"Time features: {len(time_features)}\n")
+    f.write(f"Categorical features: {len(categorical_features)}\n")
+    f.write(f"Table 1 continuous variables: {len(table_cont_cols)}\n")
+    f.write(f"Table 1 categorical variables: {len(table_cat_cols)}\n")
+    f.write("Added 95% CI to model summary.\n")
+    f.write("Added optimal threshold search and clinical metrics.\n")
+    f.write("Added bootstrap PR-AUC model comparisons.\n")
+
+print("PIPELINE COMPLETE")
+print(f"Best model by mean PR_AUC: {best_model_name}")
+print("Saved aggregated ROC / PR / Calibration figures for each model")
+print("Saved aggregate confusion matrices for each model")
+print("Saved top transplant predictors")
+print("Saved all correlations with outcome + top 10 positive / negative")
+print("Fixed Table 1 so binary numeric variables are treated as categorical")
+print("Saved model_summary_with_CI.csv")
+print("Saved optimal_thresholds.csv")
+print("Saved clinical_metrics.csv")
+print("Saved bootstrap_model_comparisons.csv")
+
+best_pipe.fit(X, y)
+# SHAP EXPLAINER OUTPUT FOR XGB BEST MODEL
+print("Generating SHAP outputs for XGB...")
+
+#  meaningful features 
+keep_features = [
+    "brain_death_1",
+    "time_procured_missing_1",
+    "EBV (VCA) (IgG)_1.0",
+    "time_asystole_missing_1",
+    "Procured_Year",
+    "Height_m",
+    "WeightKg",
+    "Intake_Total",
+    "Intake_Colloid",
+    "OPO_OPO5",
+    "BMI",
+    "ABO_BloodType_O_0",  # this becomes "Non-blood type O"
+]
+
+X_clean = X[keep_features]
+
+#  Recompute SHAP 
+explainer = shap.Explainer(model)
+shap_values = explainer(X_clean)
+
+# Rename for plotting 
+rename_map = {
+    "brain_death_1": "Brain death",
+    "time_procured_missing_1": "Procurement time missing",
+    "EBV (VCA) (IgG)_1.0": "EBV IgG positive",
+    "time_asystole_missing_1": "Asystole time missing",
+    "Procured_Year": "Procurement year",
+    "Height_m": "Height (m)",
+    "WeightKg": "Weight (kg)",
+    "Intake_Total": "Total intake",
+    "Intake_Colloid": "Colloid intake",
+    "OPO_OPO5": "OPO region 5",
+    "BMI": "BMI",
+    "ABO_BloodType_O_0": "Non-blood type O"
+}
+
+X_clean = X_clean.rename(columns=rename_map)
+
+# Plot 
+shap.summary_plot(shap_values, X_clean, show=False)
+plt.title("SHAP Summary – Significant Predictors")
+plt.tight_layout()
+plt.savefig("shap_final_clean.png", dpi=300)
