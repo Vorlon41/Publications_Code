@@ -1,0 +1,68 @@
+# Resolve timestamps
+
+from pathlib import Path
+import pandas as pd
+import numpy as np
+
+root = Path(
+    r"C:\Users\chris\OneDrive\Desktop\Publication Projects\Eathdata"
+    r"\ATTREX\ATTREX-Aircraft_navigational_and_meteorological_Measurements_1-20261025_192825"
+)
+
+folder = root / "analysis_step2"
+
+names = [
+    "ATTREX-MMS-1HZ_GHawk_20140313_R3_clean.csv",
+    "ATTREX-MMS-1HZ_GHawk_20140314_R0_clean.csv"
+]
+
+frames = []
+
+for name in names:
+    df = pd.read_csv(
+        folder / name,
+        usecols=["TIME_UTC", "G_LAT", "G_LONG", "G_ALT"]
+    )
+
+    date = name.split("_")[2]
+
+    df["timestamp"] = (
+        pd.Timestamp(date, tz="UTC")
+        + pd.to_timedelta(df["TIME_UTC"], unit="s")
+    )
+
+    df["source"] = name
+    frames.append(df)
+
+a, b = frames
+
+print("March 13 absolute range:")
+print(a.timestamp.min(), a.timestamp.max())
+
+print("\nMarch 14 absolute range:")
+print(b.timestamp.min(), b.timestamp.max())
+
+# Compare observations with matching absolute timestamps
+a["second"] = a.timestamp.dt.round("s")
+b["second"] = b.timestamp.dt.round("s")
+
+merged = a.merge(
+    b,
+    on="second",
+    suffixes=("_13", "_14")
+)
+
+print("\nMatched absolute timestamps:", len(merged))
+
+if len(merged):
+    for variable in ["G_LAT", "G_LONG", "G_ALT"]:
+        differences = (
+            merged[f"{variable}_13"]
+            - merged[f"{variable}_14"]
+        ).abs()
+
+        print(
+            variable,
+            "median difference:",
+            differences.median()
+        )
