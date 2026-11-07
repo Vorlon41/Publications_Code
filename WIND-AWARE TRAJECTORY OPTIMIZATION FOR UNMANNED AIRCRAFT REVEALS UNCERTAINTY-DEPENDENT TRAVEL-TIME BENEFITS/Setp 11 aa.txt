@@ -1,0 +1,51 @@
+from pathlib import Path
+import xarray as xr
+
+root = Path(
+    r"C:\Users\chris\OneDrive\Desktop\Publication Projects\Eathdata"
+    r"\ATTREX\ATTREX-Aircraft_navigational_and_meteorological_Measurements_1-20261025_192825"
+)
+
+grib_file = root / "4218a346c038961a43934d722972a5ad.grib"
+
+ds = xr.open_dataset(
+    grib_file,
+    engine="cfgrib",
+    backend_kwargs={"indexpath": ""}
+)
+
+print(ds)
+print("\nVariables:", list(ds.data_vars))
+print("Coordinates:", list(ds.coords))
+
+import numpy as np
+import pandas as pd
+
+# ERA5 geopotential is expressed in m²/s².
+# Convert to geopotential height in meters.
+g0 = 9.80665
+
+height = ds["z"] / g0
+
+# Summarize height ranges at each pressure level
+rows = []
+
+for level in ds.isobaricInhPa.values:
+    h = height.sel(isobaricInhPa=level)
+
+    rows.append({
+        "pressure_hPa": float(level),
+        "min_height_m": float(h.min()),
+        "median_height_m": float(h.median()),
+        "max_height_m": float(h.max())
+    })
+
+height_summary = pd.DataFrame(rows)
+
+print(height_summary.to_string(index=False))
+
+print("\nATTREX reference altitudes:")
+print("Segment 1986:", 16232, "m")
+print("Segment 1450:", 16208, "m")
+
+

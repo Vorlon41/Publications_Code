@@ -1,0 +1,72 @@
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+ROOT = Path(
+    r"C:\Users\chris\OneDrive\Desktop\Publication Projects\Eathdata\ATTREX"
+    r"\ATTREX-Aircraft_navigational_and_meteorological_Measurements_1-20261025_192825"
+)
+
+OUT = ROOT / "analysis_step31"
+OUT.mkdir(parents=True, exist_ok=True)
+
+march11 = ROOT / "ERA5_ATTREX_20140311_20140312_expanded.grib"
+march12 = ROOT / "18cad2befa67fe3b521e994ec79431c6.grib"
+
+ds11 = xr.open_dataset(
+    march11, engine="cfgrib",
+    backend_kwargs={"indexpath": ""}
+)
+
+ds12 = xr.open_dataset(
+    march12, engine="cfgrib",
+    backend_kwargs={"indexpath": ""}
+)
+
+required = {"u", "v", "z", "t"}
+
+for name, ds in [("March 11", ds11), ("March 12", ds12)]:
+    if not required.issubset(ds.data_vars):
+        raise ValueError(f"{name}: Missing variables")
+
+    print(name, ":", ds.time.values.min(), "to", ds.time.values.max())
+
+# Ensure the spatial and vertical grids agree
+for coord in ["latitude", "longitude", "isobaricInhPa"]:
+    if not np.array_equal(ds11[coord].values, ds12[coord].values):
+        raise ValueError(f"Coordinate mismatch: {coord}")
+
+# Combine datasets along time
+combined = xr.concat(
+    [ds11[list(required)], ds12[list(required)]],
+    dim="time"
+).sortby("time")
+
+# Verify exact expected hourly timestamps
+actual = pd.DatetimeIndex(combined.time.values)
+
+expected = pd.date_range(
+    "2014-03-11 00:00",
+    "2014-03-12 23:00",
+    freq="h"
+)
+
+if not actual.equals(expected):
+    raise ValueError("ERA5 timestamps are incomplete or duplicated")
+
+print("\nCombined dataset:")
+print(combined)
+
+print("\nTotal timestamps:", combined.sizes["time"])
+print("First timestamp:", actual.min())
+print("Last timestamp:", actual.max())
+
+output_file = OUT / "ERA5_ATTREX_March11_12_2014.nc"
+
+combined.to_netcdf(output_file)
+
+print("\nSaved:", output_file)
+
+ds11.close()
+ds12.close()

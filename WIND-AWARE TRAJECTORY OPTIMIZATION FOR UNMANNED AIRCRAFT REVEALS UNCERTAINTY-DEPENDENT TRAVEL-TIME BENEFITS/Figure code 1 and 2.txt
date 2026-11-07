@@ -1,0 +1,1053 @@
+
+from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont
+
+ROOT = Path(
+    r"C:\Users\chris\OneDrive\Desktop\Publication Projects\Eathdata\ATTREX"
+    r"\ATTREX-Aircraft_navigational_and_meteorological_Measurements_1-20261025_192825"
+)
+
+SOURCE = ROOT / "analysis_step38"
+OUT = ROOT / "Figures to use"
+OUT.mkdir(parents=True, exist_ok=True)
+
+files = [
+    SOURCE / "width0_routes.png",
+    SOURCE / "width50_routes.png",
+    SOURCE / "width100_routes.png",
+]
+
+labels = [
+    "(a) No lateral deviation",
+    "(b) 50-km corridor | 48.10 s modeled advantage",
+    "(c) 100-km corridor | 93.62 s modeled advantage",
+]
+
+images = []
+for file in files:
+    if not file.exists():
+        raise FileNotFoundError(file)
+    images.append(Image.open(file).convert("RGB"))
+
+target_width = 1500
+padding = 25
+heading_height = 65
+
+resized = []
+for im in images:
+    height = round(im.height * target_width / im.width)
+    resized.append(im.resize(
+        (target_width, height),
+        Image.Resampling.LANCZOS
+    ))
+
+total_height = sum(
+    im.height + heading_height + padding
+    for im in resized
+) + padding
+
+combined = Image.new(
+    "RGB", (target_width, total_height), "white"
+)
+draw = ImageDraw.Draw(combined)
+
+try:
+    font = ImageFont.truetype("arial.ttf", 30)
+except OSError:
+    font = ImageFont.load_default()
+
+y = padding
+for label, im in zip(labels, resized):
+    draw.text((30, y), label, fill="black", font=font)
+    y += heading_height
+    combined.paste(im, (0, y))
+    y += im.height + padding
+
+output_file = OUT / "Figure4_ATTREX_Route_Comparison.png"
+combined.save(output_file, dpi=(300, 300))
+
+print("Saved:", output_file)
+
+
+
+# FIGURE 1 — ATTREX–ERA5 DATA INTEGRATION AND COMPUTATIONAL WORKFLOW
+
+
+from pathlib import Path
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+
+# Output directory
+
+ROOT = Path(
+    r"C:\Users\chris\OneDrive\Desktop\Publication Projects\Eathdata\ATTREX"
+    r"\ATTREX-Aircraft_navigational_and_meteorological_Measurements_1-20261025_192825"
+)
+
+OUT = ROOT / "Figures to use"
+OUT.mkdir(parents=True, exist_ok=True)
+
+
+# formatting
+
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 10,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+    "savefig.facecolor": "white",
+})
+
+fig, ax = plt.subplots(figsize=(12, 12))
+
+ax.set_xlim(0, 12)
+ax.set_ylim(0, 12)
+ax.axis("off")
+
+# Helper functions
+
+def add_box(x, y, w, h, title, description,
+            facecolor="#F2F4F7", edgecolor="#64748B",
+            title_size=11, description_size=9):
+
+    patch = FancyBboxPatch(
+        (x, y), w, h,
+        boxstyle="round,pad=0.025,rounding_size=0.12",
+        linewidth=1.4,
+        edgecolor=edgecolor,
+        facecolor=facecolor
+    )
+
+    ax.add_patch(patch)
+
+    ax.text(
+        x + w / 2,
+        y + h * 0.70,
+        title,
+        ha="center",
+        va="center",
+        fontsize=title_size,
+        fontweight="bold"
+    )
+
+    ax.text(
+        x + w / 2,
+        y + h * 0.32,
+        description,
+        ha="center",
+        va="center",
+        fontsize=description_size,
+        linespacing=1.4
+    )
+
+
+def arrow(x1, y1, x2, y2):
+
+    patch = FancyArrowPatch(
+        (x1, y1),
+        (x2, y2),
+        arrowstyle="-|>",
+        mutation_scale=15,
+        linewidth=1.5,
+        color="#334155",
+        connectionstyle="arc3,rad=0"
+    )
+
+    ax.add_patch(patch)
+
+
+
+# 1. Data sources
+
+add_box(
+    0.6, 10.35, 5.0, 1.15,
+    "NASA ATTREX",
+    "Aircraft position, pressure, true airspeed,\n"
+    "and observed horizontal winds",
+    facecolor="#DBEAFE",
+    edgecolor="#2563EB"
+)
+
+add_box(
+    6.4, 10.35, 5.0, 1.15,
+    "ERA5 Atmospheric Reanalysis",
+    "Gridded horizontal winds, pressure levels,\n"
+    "and hourly meteorological estimates",
+    facecolor="#DCFCE7",
+    edgecolor="#16A34A"
+)
+
+
+# 2. Data processing
+
+
+add_box(
+    1.2, 8.75, 9.6, 1.05,
+    "Data Preprocessing and Meteorological Collocation",
+    "Temporal alignment, geographic interpolation,\n"
+    "pressure-level matching, and data quality checks",
+    facecolor="#E2E8F0",
+    edgecolor="#64748B"
+)
+
+arrow(3.1, 10.35, 3.1, 9.80)
+arrow(8.9, 10.35, 8.9, 9.80)
+
+# 3. Meteorological validation
+
+
+add_box(
+    1.2, 7.25, 9.6, 1.0,
+    "Meteorological Validation and Route Construction",
+    "ERA5–ATTREX wind agreement and construction\n"
+    "of candidate geographic routing corridors",
+    facecolor="#F3E8FF",
+    edgecolor="#9333EA"
+)
+
+arrow(6.0, 8.75, 6.0, 8.25)
+
+
+# 4. Parallel routing algorithms
+
+
+add_box(
+    0.6, 5.45, 5.0, 1.15,
+    "Distance-Minimizing Routing",
+    "Geographic distance objective\n"
+    "Conventional routing baseline",
+    facecolor="#FEF3C7",
+    edgecolor="#D97706"
+)
+
+add_box(
+    6.4, 5.45, 5.0, 1.15,
+    "Wind-Aware Routing",
+    "Time-dependent ERA5 travel-time objective\n"
+    "Atmospheric wind integration",
+    facecolor="#FEE2E2",
+    edgecolor="#DC2626"
+)
+
+# Branch from common processing stage
+arrow(6.0, 7.25, 6.0, 6.95)
+
+ax.plot(
+    [3.1, 8.9],
+    [6.95, 6.95],
+    color="#334155",
+    linewidth=1.5
+)
+
+arrow(3.1, 6.95, 3.1, 6.60)
+arrow(8.9, 6.95, 8.9, 6.60)
+
+
+# 5. Verification and uncertainty
+
+
+add_box(
+    1.2, 3.50, 9.6, 1.25,
+    "Numerical Verification and Atmospheric Uncertainty",
+    "Integration convergence, route-equivalence tests, FIFO audit,\n"
+    "fixed-route sensitivity, reoptimization, and separate-field evaluation",
+    facecolor="#DBEAFE",
+    edgecolor="#2563EB",
+    description_size=9
+)
+
+arrow(3.1, 5.45, 3.1, 5.10)
+arrow(8.9, 5.45, 8.9, 5.10)
+
+ax.plot(
+    [3.1, 8.9],
+    [5.10, 5.10],
+    color="#334155",
+    linewidth=1.5
+)
+
+arrow(6.0, 5.10, 6.0, 4.75)
+
+
+# 6. Final outcomes
+
+
+add_box(
+    1.2, 1.75, 9.6, 1.05,
+    "Final Computational Outcomes",
+    "Modeled travel-time differences, route geometry,\n"
+    "and uncertainty-dependent optimization benefits",
+    facecolor="#F1F5F9",
+    edgecolor="#475569"
+)
+
+arrow(6.0, 3.50, 6.0, 2.80)
+
+
+# Figure title
+
+
+ax.text(
+    6.0, 11.85,
+    "ATTREX–ERA5 Data Integration and Computational Workflow",
+    ha="center",
+    va="center",
+    fontsize=15,
+    fontweight="bold"
+)
+
+
+# Save files
+
+fig.savefig(
+    OUT / "Figure1_ATTREX_ERA5_Workflow.png",
+    dpi=300,
+    bbox_inches="tight",
+    pad_inches=0.15
+)
+
+fig.savefig(
+    OUT / "Figure1_ATTREX_ERA5_Workflow.pdf",
+    bbox_inches="tight",
+    pad_inches=0.15
+)
+
+plt.show()
+
+print("\nFigure 1 successfully generated.")
+print("PNG:", OUT / "Figure1_ATTREX_ERA5_Workflow.png")
+print("PDF:", OUT / "Figure1_ATTREX_ERA5_Workflow.pdf")
+
+
+
+
+
+# FIGURE 2 — ATTREX FLIGHT GEOGRAPHY AND ERA5 COVERAGE
+
+from pathlib import Path
+import shutil
+import tempfile
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+import matplotlib.pyplot as plt
+
+from matplotlib.patches import Rectangle
+from matplotlib.lines import Line2D
+from matplotlib.gridspec import GridSpec
+from matplotlib.ticker import MaxNLocator
+
+
+# 1. PROJECT DIRECTORIES
+
+ROOT = Path(
+    r"C:\Users\chris\OneDrive\Desktop\Publication Projects"
+    r"\Eathdata\ATTREX"
+    r"\ATTREX-Aircraft_navigational_and_meteorological_Measurements_1-20261025_192825"
+)
+
+FINAL_OUT = ROOT / "Figures to use"
+TEMP_OUT = Path(tempfile.gettempdir()) / "ATTREX_Figures"
+
+ERA5 = (
+    ROOT / "analysis_step31"
+    / "ERA5_ATTREX_March11_12_2014.nc"
+)
+
+FINAL_OUT.mkdir(parents=True, exist_ok=True)
+TEMP_OUT.mkdir(parents=True, exist_ok=True)
+
+SEGMENTS = [1925, 1986, 1450, 2798, 3595]
+WESTERN_SEGMENTS = [1986, 1450, 2798, 3595]
+
+# Verified observation files from previous runs.
+FILES = {
+    1925: ROOT / "analysis_step9"
+          / "20150305_segment_1925_observations.csv",
+
+    1986: ROOT / "analysis_step9"
+          / "20140311_segment_1986_observations.csv",
+
+    1450: ROOT / "analysis_step9"
+          / "20140311_segment_1450_observations.csv",
+
+    2798: ROOT / "analysis_step23"
+          / "20140311_segment_2798_observations.csv",
+
+    3595: ROOT / "analysis_step23"
+          / "20140311_segment_3595_observations.csv",
+}
+
+COLORS = {
+    1925: "#7C3AED",
+    1986: "#D97706",
+    1450: "#059669",
+    2798: "#2563EB",
+    3595: "#DC2626",
+}
+
+
+# 2. PUBLICATION FORMATTING
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 10,
+    "axes.titlesize": 11,
+    "axes.labelsize": 10,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+    "savefig.facecolor": "white",
+    "axes.spines.top": True,
+    "axes.spines.right": True,
+})
+
+
+# 3. READ OBSERVED FLIGHT COORDINATES
+
+def read_track(path):
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing observation file: {path}"
+        )
+
+    df = pd.read_csv(path, low_memory=False)
+
+    required = {"G_LAT", "G_LONG"}
+
+    if not required.issubset(df.columns):
+        raise ValueError(
+            f"Missing coordinate columns: {path}"
+        )
+
+    lat = pd.to_numeric(
+        df["G_LAT"], errors="coerce"
+    )
+
+    lon = pd.to_numeric(
+        df["G_LONG"], errors="coerce"
+    )
+
+    valid = (
+        lat.notna()
+        & lon.notna()
+        & lat.between(-90, 90)
+        & lon.between(-180, 360)
+    )
+
+    track = pd.DataFrame({
+        "latitude": lat[valid].to_numpy(),
+        "longitude": lon[valid].to_numpy()
+    })
+
+    # Normalize to -180 through +180 degrees.
+    track["longitude"] = (
+        (track["longitude"] + 180) % 360
+    ) - 180
+
+    if len(track) < 2:
+        raise ValueError(
+            f"Insufficient valid coordinates: {path}"
+        )
+
+    return track
+
+
+# 4. LOAD ATTREX SEGMENTS
+
+tracks = {}
+
+print("\nLoading ATTREX flight segments...")
+
+for segment in SEGMENTS:
+
+    track = read_track(FILES[segment])
+    tracks[segment] = track
+
+    print(
+        f"Segment {segment}: "
+        f"{len(track):,} observations"
+    )
+
+    print(
+        f"  Latitude: "
+        f"{track.latitude.min():.2f} "
+        f"to {track.latitude.max():.2f}"
+    )
+
+    print(
+        f"  Longitude: "
+        f"{track.longitude.min():.2f} "
+        f"to {track.longitude.max():.2f}"
+    )
+
+
+# 5. LOAD ERA5 GEOGRAPHIC DOMAIN
+
+if not ERA5.exists():
+    raise FileNotFoundError(
+        f"Missing ERA5 dataset: {ERA5}"
+    )
+
+with xr.open_dataset(ERA5) as ds:
+
+    lat_min = float(ds.latitude.min())
+    lat_max = float(ds.latitude.max())
+
+    lon_min = float(ds.longitude.min())
+    lon_max = float(ds.longitude.max())
+
+print("\nExpanded ERA5 domain:")
+print(f"Latitude: {lat_min} to {lat_max}")
+print(f"Longitude: {lon_min} to {lon_max}")
+
+
+# 6. CREATE THREE-PANEL FIGURE
+
+fig = plt.figure(figsize=(18, 6))
+
+gs = GridSpec(
+    1, 3,
+    figure=fig,
+    width_ratios=[1.3, 0.8, 1.3],
+    left=0.055,
+    right=0.985,
+    bottom=0.25,   # Reserve space for shared legend
+    top=0.90,
+    wspace=0.30
+)
+
+ax1 = fig.add_subplot(gs[0, 0])
+ax2 = fig.add_subplot(gs[0, 1])
+ax3 = fig.add_subplot(gs[0, 2])
+
+
+# 7. PANEL (a): WESTERN PACIFIC
+
+for segment in WESTERN_SEGMENTS:
+
+    track = tracks[segment]
+
+    ax1.plot(
+        track.longitude,
+        track.latitude,
+        color=COLORS[segment],
+        linewidth=2.0 if segment == 3595 else 1.5,
+        alpha=0.9,
+        zorder=3
+    )
+
+domain1 = Rectangle(
+    (lon_min, lat_min),
+    lon_max - lon_min,
+    lat_max - lat_min,
+    fill=False,
+    edgecolor="black",
+    linestyle="--",
+    linewidth=1.4,
+    zorder=4
+)
+
+ax1.add_patch(domain1)
+
+ax1.set_title(
+    "(a) Western Pacific segments",
+    fontweight="bold",
+    pad=10
+)
+
+ax1.set_xlabel("Longitude (°E)")
+ax1.set_ylabel("Latitude (°N)")
+
+ax1.set_xlim(142, 162)
+ax1.set_ylim(7, 37)
+
+ax1.grid(alpha=0.2)
+
+
+# 8. PANEL (b): EASTERN PACIFIC
+
+track = tracks[1925]
+
+ax2.plot(
+    track.longitude,
+    track.latitude,
+    color=COLORS[1925],
+    linewidth=2.0,
+    zorder=3
+)
+
+ax2.set_title(
+    "(b) Eastern Pacific segment 1925",
+    fontweight="bold",
+    pad=10
+)
+
+# Negative longitude values retained.
+ax2.set_xlabel("Longitude (°)")
+ax2.set_ylabel("Latitude (°N)")
+
+ax2.set_xlim(-123, -118)
+ax2.set_ylim(33, 35.5)
+
+ax2.xaxis.set_major_locator(
+    MaxNLocator(nbins=5)
+)
+
+ax2.yaxis.set_major_locator(
+    MaxNLocator(nbins=5)
+)
+
+ax2.grid(alpha=0.2)
+
+
+# 9. PANEL (c): PRIMARY OPTIMIZATION SEGMENT
+
+track = tracks[3595]
+
+ax3.plot(
+    track.longitude,
+    track.latitude,
+    color=COLORS[3595],
+    linewidth=1.8,
+    zorder=3
+)
+
+# Observed start
+ax3.scatter(
+    track.longitude.iloc[0],
+    track.latitude.iloc[0],
+    color="green",
+    s=55,
+    zorder=5
+)
+
+# Observed end
+ax3.scatter(
+    track.longitude.iloc[-1],
+    track.latitude.iloc[-1],
+    color="blue",
+    s=55,
+    zorder=5
+)
+
+domain3 = Rectangle(
+    (lon_min, lat_min),
+    lon_max - lon_min,
+    lat_max - lat_min,
+    fill=False,
+    edgecolor="black",
+    linestyle="--",
+    linewidth=1.4,
+    zorder=4
+)
+
+ax3.add_patch(domain3)
+
+ax3.set_title(
+    "(c) Primary optimization segment 3595",
+    fontweight="bold",
+    pad=10
+)
+
+ax3.set_xlabel("Longitude (°E)")
+ax3.set_ylabel("Latitude (°N)")
+
+ax3.set_xlim(142, 162)
+ax3.set_ylim(7, 37)
+
+ax3.grid(alpha=0.2)
+
+
+# 10. ONE SHARED LEGEND BELOW ALL PANELS
+
+legend_handles = [
+    Line2D(
+        [0], [0],
+        color=COLORS[1925],
+        linewidth=2,
+        label="Segment 1925"
+    ),
+    Line2D(
+        [0], [0],
+        color=COLORS[1986],
+        linewidth=2,
+        label="Segment 1986"
+    ),
+    Line2D(
+        [0], [0],
+        color=COLORS[1450],
+        linewidth=2,
+        label="Segment 1450"
+    ),
+    Line2D(
+        [0], [0],
+        color=COLORS[2798],
+        linewidth=2,
+        label="Segment 2798"
+    ),
+    Line2D(
+        [0], [0],
+        color=COLORS[3595],
+        linewidth=2,
+        label="Segment 3595"
+    ),
+    Line2D(
+        [0], [0],
+        color="black",
+        linestyle="--",
+        linewidth=1.5,
+        label="March 11–12 ERA5 domain"
+    ),
+    Line2D(
+        [0], [0],
+        marker="o",
+        color="none",
+        markerfacecolor="green",
+        markeredgecolor="green",
+        markersize=7,
+        label="Segment 3595 start"
+    ),
+    Line2D(
+        [0], [0],
+        marker="o",
+        color="none",
+        markerfacecolor="blue",
+        markeredgecolor="blue",
+        markersize=7,
+        label="Segment 3595 end"
+    ),
+]
+
+fig.legend(
+    handles=legend_handles,
+    loc="lower center",
+    bbox_to_anchor=(0.52, 0.045),
+    ncol=4,
+    fontsize=9,
+    frameon=False,
+    columnspacing=1.8,
+    handlelength=2.5
+)
+
+
+# 11. SAVE FIGURE
+
+png_name = "Figure2_ATTREX_ERA5_Geography.png"
+pdf_name = "Figure2_ATTREX_ERA5_Geography.pdf"
+
+temp_png = TEMP_OUT / png_name
+temp_pdf = TEMP_OUT / pdf_name
+
+final_png = FINAL_OUT / png_name
+final_pdf = FINAL_OUT / pdf_name
+
+print("\nSaving Figure 2...")
+
+# Save to short local paths first.
+fig.savefig(
+    str(temp_png),
+    dpi=300,
+    bbox_inches="tight",
+    pad_inches=0.15
+)
+
+fig.savefig(
+    str(temp_pdf),
+    bbox_inches="tight",
+    pad_inches=0.15
+)
+
+print("Temporary PNG:", temp_png)
+print("Temporary PDF:", temp_pdf)
+
+# Copy into manuscript figure directory.
+for source, destination in [
+    (temp_png, final_png),
+    (temp_pdf, final_pdf)
+]:
+
+    try:
+        shutil.copy2(source, destination)
+        print("Saved:", destination)
+
+    except OSError as exc:
+        print(
+            "\nWARNING: Could not copy to manuscript folder."
+        )
+        print("Destination:", destination)
+        print("Error:", repr(exc))
+        print("Temporary file remains available:", source)
+
+plt.show()
+
+print("\nFigure 2 generation completed.")
+
+print("\nOutput verification:")
+
+for path in [
+    temp_png,
+    temp_pdf,
+    final_png,
+    final_pdf
+]:
+    print(
+        path.name,
+        "| Exists:",
+        path.exists(),
+        "| Location:",
+        path.parent
+    )
+
+print("\nIncluded segments:", sorted(tracks))
+
+print("\nIMPORTANT:")
+print(
+    "The dashed rectangle represents only the "
+    "expanded March 11–12 ERA5 domain."
+)
+print(
+    "It does not establish meteorological coverage "
+    "for every validated flight."
+)
+
+
+# ATTREX — TABLE 1 CORRELATION VERIFICATION
+
+from pathlib import Path
+import pandas as pd
+
+ROOT = Path(
+    r"C:\Users\chris\OneDrive\Desktop\Publication Projects"
+    r"\Eathdata\ATTREX"
+    r"\ATTREX-Aircraft_navigational_and_meteorological_Measurements_1-20261025_192825"
+)
+
+SOURCE = (
+    ROOT / "analysis_step42"
+    / "table1_era5_wind_validation.csv"
+)
+
+if not SOURCE.exists():
+    raise FileNotFoundError(
+        f"Missing Step 42 Table 1:\n{SOURCE}"
+    )
+
+df = pd.read_csv(SOURCE)
+
+print("\nAVAILABLE COLUMNS:")
+print(df.columns.tolist())
+
+print("\nFULL VALIDATION TABLE:")
+print(df.to_string(index=False))
+
+# Identify correlation columns
+
+possible_u = [
+    "corr_u",
+    "u_correlation",
+    "u_corr",
+    "correlation_u",
+]
+
+possible_v = [
+    "corr_v",
+    "v_correlation",
+    "v_corr",
+    "correlation_v",
+]
+
+u_col = next(
+    (c for c in possible_u if c in df.columns),
+    None
+)
+
+v_col = next(
+    (c for c in possible_v if c in df.columns),
+    None
+)
+
+if u_col is None or v_col is None:
+    print(
+        "\nCorrelation columns not found "
+        "under expected names."
+    )
+    print(
+        "Review the columns printed above."
+    )
+
+else:
+    segment_col = next(
+        (
+            c for c in [
+                "segment",
+                "segment_id"
+            ]
+            if c in df.columns
+        ),
+        None
+    )
+
+    if segment_col is None:
+        raise ValueError(
+            "Segment identifier column not found."
+        )
+
+    print("\n" + "=" * 65)
+    print("VERIFIED PEARSON CORRELATIONS")
+    print("=" * 65)
+
+    result = df[
+        [segment_col, u_col, v_col]
+    ].copy()
+
+    result = result.rename(columns={
+        segment_col: "Segment",
+        u_col: "U correlation (r)",
+        v_col: "V correlation (r)"
+    })
+
+    print(
+        result.to_string(
+            index=False,
+            float_format=lambda x: f"{x:.6f}"
+        )
+    )
+
+    # Validate coefficient ranges.
+    for col in [
+        "U correlation (r)",
+        "V correlation (r)"
+    ]:
+        values = pd.to_numeric(
+            result[col],
+            errors="coerce"
+        )
+
+        if values.isna().any():
+            print(
+                f"WARNING: Missing values in {col}"
+            )
+
+        if (values.abs() > 1).any():
+            raise ValueError(
+                f"Invalid Pearson correlation in {col}"
+            )
+
+    print("\nCorrelation verification completed.")
+
+
+
+from pathlib import Path
+import pandas as pd
+import re
+
+ROOT = Path(
+    r"C:\Users\chris\OneDrive\Desktop\Publication Projects"
+    r"\Eathdata\ATTREX"
+    r"\ATTREX-Aircraft_navigational_and_meteorological_Measurements_1-20261025_192825"
+)
+
+TARGET_SEGMENTS = [1450, 1986]
+
+U_NAMES = [
+    "u_correlation", "corr_u",
+    "u_corr", "correlation_u"
+]
+
+V_NAMES = [
+    "v_correlation", "corr_v",
+    "v_corr", "correlation_v"
+]
+
+SEGMENT_NAMES = ["segment", "segment_id"]
+
+results = []
+
+print("\nSearching existing validation CSV files...\n")
+
+for path in ROOT.rglob("*.csv"):
+
+    # Avoid large observation, trial, and route files.
+    name = path.name.lower()
+
+    if not any(term in name for term in [
+        "metric", "validation", "summary",
+        "comparison", "collocat", "matched"
+    ]):
+        continue
+
+    try:
+        df = pd.read_csv(path, nrows=100)
+    except Exception:
+        continue
+
+    u_col = next(
+        (c for c in U_NAMES if c in df.columns), None
+    )
+
+    v_col = next(
+        (c for c in V_NAMES if c in df.columns), None
+    )
+
+    if u_col is None or v_col is None:
+        continue
+
+    segment_col = next(
+        (c for c in SEGMENT_NAMES if c in df.columns),
+        None
+    )
+
+    if segment_col is not None:
+
+        for segment in TARGET_SEGMENTS:
+
+            subset = df[
+                pd.to_numeric(
+                    df[segment_col], errors="coerce"
+                ) == segment
+            ]
+
+            for _, row in subset.iterrows():
+
+                results.append({
+                    "segment": segment,
+                    "u_correlation": row[u_col],
+                    "v_correlation": row[v_col],
+                    "source": str(path)
+                })
+
+    else:
+        # Only assign segment from an explicit filename match.
+        for segment in TARGET_SEGMENTS:
+
+            if re.search(
+                rf"(?<!\d){segment}(?!\d)",
+                path.name
+            ):
+
+                for _, row in df.iterrows():
+
+                    results.append({
+                        "segment": segment,
+                        "u_correlation": row[u_col],
+                        "v_correlation": row[v_col],
+                        "source": str(path)
+                    })
+
+if results:
+
+    output = pd.DataFrame(results).drop_duplicates()
+
+    print("FOUND CORRELATION RESULTS:\n")
+    print(output.to_string(index=False))
+
+else:
+
+    print(
+        "No stored correlation metrics found "
+        "for segments 1450 and 1986."
+    )
+

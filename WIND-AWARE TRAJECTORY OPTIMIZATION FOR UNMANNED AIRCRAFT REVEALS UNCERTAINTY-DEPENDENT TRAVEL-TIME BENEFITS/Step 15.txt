@@ -1,0 +1,35 @@
+import xarray as xr
+from pathlib import Path
+
+root = Path(
+    r"C:\Users\chris\OneDrive\Desktop\Publication Projects\Eathdata"
+    r"\ATTREX\ATTREX-Aircraft_navigational_and_meteorological_Measurements_1-20261025_192825"
+)
+
+grib_file = root / "6ae42b7a70fdd5fdc0662512e3830732.grib"
+
+ds = xr.open_dataset(
+    grib_file,
+    engine="cfgrib",
+    backend_kwargs={"indexpath": ""}
+)
+
+print("Time coverage:", ds.time.values[0], "to", ds.time.values[-1])
+print("Pressure levels:", ds.isobaricInhPa.values)
+print("Latitude range:", float(ds.latitude.min()), "to", float(ds.latitude.max()))
+print("Longitude range:", float(ds.longitude.min()), "to", float(ds.longitude.max()))
+print("Variables:", list(ds.data_vars))
+
+# Check whether the dataset covers the required period
+times = ds.time.values.astype("datetime64[D]")
+
+correct_dates = (
+    times.min() <= __import__("numpy").datetime64("2015-03-05")
+    and times.max() >= __import__("numpy").datetime64("2015-03-06")
+)
+
+required_variables = {"u", "v", "z", "t"}
+variables_ok = required_variables.issubset(set(ds.data_vars))
+
+print("\nCorrect 2015 dates:", correct_dates)
+print("Required variables present:", variables_ok)
